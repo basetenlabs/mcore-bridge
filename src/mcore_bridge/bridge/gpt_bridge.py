@@ -1887,6 +1887,211 @@ class GPTBridge:
                     k, v = kv
                 yield k, v
 
+    # ── Multi-LoRA registry ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _slot_name(index: int) -> str:
+        return f'__slot_{index}__'
+
+    @staticmethod
+    def _slot_index(slot_name: str) -> int:
+        return int(slot_name.removeprefix('__slot_').removesuffix('__'))
+
+    @staticmethod
+    def _lora_root(mg_model):
+        """Walk through PEFT wrappers to the Megatron model instance."""
+        root = mg_model
+        while hasattr(root, 'base_model') and not isinstance(root, LoraParallelLinear):
+            root = root.base_model
+        if hasattr(root, 'model'):
+            root = root.model
+        return root
+
+    def preallocate_adapters(
+        self,
+        mg_models: List,
+        num_slots: int,
+        lora_config,
+    ) -> None:
+        """Create `num_slots` pre-allocated PEFT adapter slots on the model.
+
+        Slot names are ``'__slot_0__'`` … ``'__slot_{num_slots-1}__'``.
+        Integer routing indices: 0 = base-only, 1 … num_slots = slots 0 … num_slots-1.
+
+        Args:
+            mg_models: List containing the PEFT-wrapped Megatron model.
+            num_slots: Number of concurrent adapters to support.
+            lora_config: ``peft.LoraConfig`` describing rank, target modules, etc.
+        """
+        self._adapter_registry: dict = {}  # logical_name → slot_name
+
+        # Operate on ALL model chunks so that virtual pipeline parallelism
+        # (interleaved schedule, multiple chunks per rank) gets correctly set up.
+        all_models = unwrap_model(mg_models)
+
+        for mg_model in all_models:
+            for i in range(num_slots):
+                mg_model.add_adapter(self._slot_name(i), lora_config)
+
+        # Enable requires_grad for ALL slots AFTER adding all adapters.
+        # add_adapter freezes previously added adapters each time it's called,
+        # so we must re-enable all slots in a single pass at the end.
+        idx_to_name = {i + 1: self._slot_name(i) for i in range(num_slots)}
+        for mg_model in all_models:
+            for i in range(num_slots):
+                slot_name = self._slot_name(i)
+                for m in mg_model.modules():
+                    if isinstance(m, LoraParallelLinear):
+                        for d in (m.lora_A, m.lora_B, m.lora_dropout):
+                            if slot_name not in d:
+                                continue
+                            mod = d[slot_name]
+                            if hasattr(mod, 'parameters'):
+                                for p in mod.parameters():
+                                    p.requires_grad_(True)
+
+            # Stamp _idx_to_name on every LoraParallelLinear so the routing path
+            # knows which slot corresponds to each integer index.
+            for m in mg_model.modules():
+                if isinstance(m, LoraParallelLinear):
+                    m._idx_to_name = idx_to_name
+
+    def register_adapter(
+        self,
+        mg_models: List,
+        name: str,
+        slot_index: int,
+        weights_dir: Optional[str] = None,
+    ) -> None:
+        """Bind logical `name` to adapter slot `slot_index`.
+
+        Optionally loads PEFT weights from `weights_dir` into the slot.
+        The checkpoint must have been saved with adapter_name ``'default'``
+        (the PEFT default) — keys are renamed to the slot on the fly.
+
+        Args:
+            mg_models: List containing the PEFT-wrapped Megatron model.
+            name: Logical name (e.g. ``"user_a"``).
+            slot_index: Which pre-allocated slot (0-based) to bind to.
+            weights_dir: Optional directory with a PEFT checkpoint to load.
+        """
+        slot_name = self._slot_name(slot_index)
+        registry = getattr(self, '_adapter_registry', {})
+        registry[name] = slot_name
+        self._adapter_registry = registry
+
+        if weights_dir is not None:
+            # load_weights uses self._adapter_name; the checkpoint keys have the
+            # checkpoint's own adapter name which we need to remap to slot_name.
+            from mcore_bridge.utils import SafetensorLazyLoader
+
+            mg_models_unwrapped = unwrap_model(mg_models)
+            with torch.no_grad(), SafetensorLazyLoader(weights_dir, peft_format=True) as loader:
+                state_dict = loader.get_state_dict()
+
+            # Detect the adapter name stored in the checkpoint.
+            # Checkpoints saved by save_weights(peft_format=True) use pure HF
+            # format: keys end in '.lora_A.weight' with no adapter name embedded.
+            # Checkpoints from model.save_pretrained() embed the name:
+            #   '.lora_A.default.weight'. Detect which case we're in.
+            ckpt_adapter = None
+            for key in state_dict:
+                for marker in ('lora_A.', 'lora_B.'):
+                    if marker in key:
+                        after = key.split(marker)[-1]
+                        candidate = after.split('.')[0]
+                        # 'weight' means pure HF format — no adapter name in key
+                        if candidate != 'weight':
+                            ckpt_adapter = candidate
+                        break
+                else:
+                    continue
+                break
+
+            # Rename checkpoint adapter name → target slot name only when the
+            # checkpoint embeds a named adapter (e.g. "default") in its keys.
+            # Pure HF format has no adapter name to rename; _convert reads the
+            # keys as-is and writes into self._adapter_name (= slot_name).
+            if ckpt_adapter is not None and ckpt_adapter != slot_name:
+                renamed = {}
+                for k, v in state_dict.items():
+                    renamed[k.replace(f'.{ckpt_adapter}.', f'.{slot_name}.')] = v
+                state_dict = renamed
+
+            old_adapter_name = self._adapter_name
+            self._peft_format = True
+            self._adapter_name = slot_name
+            hf_prefix = 'base_model.model.'
+            for mg_model in mg_models_unwrapped:
+                list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
+            self._adapter_name = old_adapter_name
+
+    def unload_adapter(self, name: str) -> None:
+        """Remove the logical name → slot binding.
+
+        The slot stays allocated so the optimizer graph is not disturbed.
+
+        Args:
+            name: Logical adapter name to remove.
+        """
+        getattr(self, '_adapter_registry', {}).pop(name, None)
+
+    def list_adapters(self) -> dict:
+        """Return a copy of ``{logical_name: slot_name}`` for all registered adapters."""
+        return dict(getattr(self, '_adapter_registry', {}))
+
+    def resolve_routing(self, adapter_names: List[Optional[str]]) -> torch.Tensor:
+        """Convert a list of adapter names to integer routing indices.
+
+        ``None`` or unknown names map to ``0`` (base-only).
+        Returns a ``LongTensor`` of shape ``[len(adapter_names)]``.
+
+        Args:
+            adapter_names: One name per sequence in the batch.
+        """
+        registry = getattr(self, '_adapter_registry', {})
+        indices = []
+        for name in adapter_names:
+            if name is None or name not in registry:
+                indices.append(0)
+            else:
+                slot_name = registry[name]
+                indices.append(self._slot_index(slot_name) + 1)  # 0=base; 1…N=slots 0…N-1
+        return torch.tensor(indices, dtype=torch.long)
+
+    @contextmanager
+    def set_routing(self, mg_models: List, adapter_names: List[Optional[str]]):
+        """Context manager: stamp ``_lora_adapter_indices`` on the root Megatron model.
+
+        Stamps ``_lora_adapter_indices = resolve_routing(adapter_names)`` before
+        the block and deletes it afterward, restoring normal single-adapter behavior.
+
+        Usage::
+
+            with bridge.set_routing(mg_models, ["user_a", "user_b"]):
+                output = mg_model(input_ids=..., ...)
+
+        Args:
+            mg_models: List containing the PEFT-wrapped Megatron model.
+            adapter_names: One name per sequence in the batch (``None`` = base-only).
+        """
+        indices = self.resolve_routing(adapter_names)
+
+        # Stamp every model chunk so that virtual pipeline parallelism (PP > 1
+        # with interleaved schedule) works: each rank may hold multiple chunks,
+        # all of which need _lora_adapter_indices during the forward pass.
+        roots = [self._lora_root(m) for m in unwrap_model(mg_models)]
+        for root in roots:
+            root._lora_adapter_indices = indices
+
+        try:
+            yield
+        finally:
+            for root in roots:
+                root.__dict__.pop('_lora_adapter_indices', None)
+
+    # ── end Multi-LoRA registry ──────────────────────────────────────────────
+
     def save_weights(
         self,
         mg_models,
