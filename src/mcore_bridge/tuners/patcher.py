@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import weakref
 from contextlib import contextmanager
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.transformer.module import MegatronModule
@@ -81,8 +82,11 @@ def _patch_lora_model():
             __origin_init__(self, *args, **kwargs)
         if not isinstance(self.model, MegatronModule):
             return
+        root_ref = weakref.ref(self.model)
         for m in self.model.modules():
-            if isinstance(m, LoraLinear):
+            if isinstance(m, LoraParallelLinear):
+                m._root_ref = root_ref
+            elif isinstance(m, LoraLinear):
                 assert not isinstance(m, LoraParallelLinear)
                 for p in m.parameters():
                     if p.requires_grad:
