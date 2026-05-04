@@ -122,11 +122,29 @@ def make_batch(tasks: List[str], seq_len: int, vocab_size: int, seed: int):
     return torch.stack(inputs, dim=1).cuda(), torch.stack(labels_list, dim=1).cuda()
 
 
+def make_position_ids(config, seq_len: int, batch: int) -> torch.Tensor:
+    """Return position_ids with the shape expected by the model.
+
+    Standard models: [batch, seq_len].
+    MRoPE models (e.g. Qwen3.5-35B-A3B): [3, batch, seq_len] — the three
+    components correspond to the mrope_section axes; for text-only use they
+    are identical.
+    """
+    pos = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    if getattr(config, 'position_embedding_type', None) == 'mrope':
+        pos = pos.unsqueeze(0).expand(3, -1, -1)
+    return pos
+
+
 def eval_loss(mg_models, bridge, adapter_name: Optional[str],
-              seq_len: int, batch: int, vocab_size: int, task: str) -> float:
+              seq_len: int, batch: int, vocab_size: int, task: str,
+              config=None) -> float:
     """Single no-grad forward pass; returns mean cross-entropy loss."""
     input_ids, labels = make_batch([task] * batch, seq_len, vocab_size, seed=999)
-    pos = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    if config is None:
+        pos = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    else:
+        pos = make_position_ids(config, seq_len, batch)
     with bridge.set_routing(mg_models, [adapter_name] * batch):
         with torch.no_grad():
             out = mg_models[0](input_ids=input_ids, position_ids=pos,

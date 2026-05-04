@@ -12,8 +12,8 @@ import torch
 import mcore_bridge.patcher as _patcher
 from mcore_bridge.tuners.lora import LoraParallelLinear
 from tests.multi_lora.conftest import (
-    build_moe_model, init_megatron, make_lora_config, rank, requires_cuda,
-    synthetic_task,
+    build_moe_model, init_megatron, make_lora_config, make_position_ids,
+    rank, requires_cuda, synthetic_task,
 )
 
 EP_SIZE = 2
@@ -73,7 +73,7 @@ def test_ep2_routing_changes_output():
     torch.manual_seed(0)
     seq_len, batch = 8, 2
     input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
-    position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    position_ids = make_position_ids(config, seq_len, batch)
 
     with bridge.set_routing(mg_models, [None, None]):
         with torch.no_grad():
@@ -108,7 +108,7 @@ def test_ep2_grad_isolation():
     seq_len, batch = 8, 2
     vocab_size = config.padded_vocab_size
     input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
-    position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    position_ids = make_position_ids(config, seq_len, batch)
 
     root = mg_model.base_model.model
     lora_mods = [m for m in mg_model.modules() if isinstance(m, LoraParallelLinear)]
@@ -159,7 +159,7 @@ def test_ep2_determinism():
     vocab_size = config.padded_vocab_size
     seq_len, batch = 8, 4
     input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
-    position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+    position_ids = make_position_ids(config, seq_len, batch)
 
     with bridge.set_routing(mg_models, ["alpha", None, "alpha", None]):
         with torch.no_grad():
@@ -223,7 +223,7 @@ def test_ep2_expert_dispatch_indices():
         vocab_size = config.padded_vocab_size
         seq_len, batch = 4, 4
         input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
-        position_ids = torch.arange(seq_len, device="cuda").unsqueeze(0).expand(batch, -1)
+        position_ids = make_position_ids(config, seq_len, batch)
 
         with bridge.set_routing(mg_models, ["ada_0", "ada_1", "ada_0", None]):
             with torch.no_grad():
@@ -262,11 +262,7 @@ def test_ep2_loss_decreases():
 
     seq_len, batch_per_task = 8, 2
     vocab_size = config.padded_vocab_size
-    position_ids = (
-        torch.arange(seq_len, device="cuda")
-        .unsqueeze(0)
-        .expand(2 * batch_per_task, -1)
-    )
+    position_ids = make_position_ids(config, seq_len, 2 * batch_per_task)
 
     N_STEPS = 20
     losses = []
