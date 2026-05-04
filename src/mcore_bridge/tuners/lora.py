@@ -508,13 +508,43 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
                     out_feat = result.shape[-1]
                     total_tokens = result.numel() // out_feat
-                    x_flat = x.to(dtype).contiguous().reshape(total_tokens, -1)
-                    # Use a fresh delta buffer so index_add_ has no autograd-view conflict.
-                    # The out-of-place addition to result avoids in-place view issues.
-                    delta = torch.zeros(total_tokens, out_feat, dtype=dtype, device=result.device)
-                    apply_routed_lora(delta, x_flat, token_indices,
-                                      lora_A_by_idx, lora_B_by_idx, scaling_by_idx, dropout_by_idx)
-                    result = result + delta.view_as(result).to(result.dtype)
+                    if total_tokens > 0:
+                        x_flat = x.to(dtype).contiguous().reshape(total_tokens, -1)
+                        # Use a fresh delta buffer so index_add_ has no autograd-view conflict.
+                        # The out-of-place addition to result avoids in-place view issues.
+                        delta = torch.zeros(total_tokens, out_feat, dtype=dtype, device=result.device)
+
+                        if self.is_grouped and args and isinstance(first_A, TEGroupedLinear):
+                            # Expert grouped linear: lora_A/lora_B are TEGroupedLinear subclasses
+                            # whose per-expert weights are weight{k} with shape [out, in].
+                            # args[0] = m_splits encodes token-to-expert assignment.
+                            # Bypass TEGroupedLinear.forward (which needs m_splits for the full
+                            # fused kernel) by using F.linear per expert for gradient isolation.
+                            m_splits_list = args[0]
+                            offset = 0
+                            for k, n_k_raw in enumerate(m_splits_list):
+                                n_k = int(n_k_raw)
+                                offset_end = offset + n_k
+                                if n_k > 0:
+                                    sub_x = x_flat[offset:offset_end]
+                                    sub_idx = token_indices[offset:offset_end]
+                                    for idx, lora_A in lora_A_by_idx.items():
+                                        rows = (sub_idx == idx).nonzero(as_tuple=True)[0]
+                                        if rows.numel() == 0:
+                                            continue
+                                        x_sub = sub_x.index_select(0, rows)
+                                        w_A = getattr(lora_A, f'weight{k}')
+                                        w_B = getattr(lora_B_by_idx[idx], f'weight{k}')
+                                        a_out = F.linear(dropout_by_idx[idx](x_sub), w_A)
+                                        b_out = F.linear(a_out, w_B)
+                                        delta[offset:offset_end].index_add_(
+                                            0, rows, (b_out * scaling_by_idx[idx]).to(delta.dtype))
+                                offset = offset_end
+                        else:
+                            apply_routed_lora(delta, x_flat, token_indices,
+                                              lora_A_by_idx, lora_B_by_idx, scaling_by_idx, dropout_by_idx)
+
+                        result = result + delta.view_as(result).to(result.dtype)
             else:
                 # ── existing single-adapter path ──────────────────────────────
                 for active_adapter in self.active_adapters:

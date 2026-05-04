@@ -804,7 +804,24 @@ def _patch_MoELayer():
         if adapter_indices is None:
             return result
 
+        # Snapshot per-sequence adapter indices; expansion happens in dispatch()
+        # after token_dispatcher.dispatch() has set hidden_shape and
+        # reversed_local_input_permutation_mapping.
+        self._lora_seq_adapter_indices = adapter_indices
+
+        return result
+
+    def dispatch(self, hidden_states, probs):
+        result = _origin_dispatch(self, hidden_states, probs)
+
+        seq_indices = getattr(self, '_lora_seq_adapter_indices', None)
+        if seq_indices is None:
+            return result
+        del self._lora_seq_adapter_indices
+
         dispatcher = self.token_dispatcher
+        # hidden_shape and reversed_local_input_permutation_mapping were set by
+        # dispatch_preprocess (called from MoELayer.preprocess, before dispatch).
         hidden_shape = getattr(dispatcher, 'hidden_shape', None)
         sorted_indices = getattr(dispatcher, 'reversed_local_input_permutation_mapping', None)
         if hidden_shape is None or sorted_indices is None:
@@ -814,26 +831,16 @@ def _patch_MoELayer():
         total_tokens = 1
         for d in hidden_shape[:-1]:
             total_tokens *= d
-        batch = adapter_indices.shape[0]
+        batch = seq_indices.shape[0]
         if total_tokens % batch == 0:
             seq = total_tokens // batch
-            lora_tok = adapter_indices.unsqueeze(0).expand(seq, batch).reshape(-1)
+            lora_tok = seq_indices.unsqueeze(0).expand(seq, batch).reshape(-1)
         else:
-            lora_tok = adapter_indices.reshape(-1)
+            lora_tok = seq_indices.reshape(-1)
         lora_tok = lora_tok.to(sorted_indices.device)
-        # Apply same local permutation as dispatch_preprocess applied to hidden states
-        self._lora_pre_dispatch = lora_tok[sorted_indices]
+        # Apply same local permutation as dispatch applied to hidden states
+        pre = lora_tok[sorted_indices]
 
-        return result
-
-    def dispatch(self, hidden_states, probs):
-        result = _origin_dispatch(self, hidden_states, probs)
-
-        pre = getattr(self, '_lora_pre_dispatch', None)
-        if pre is None:
-            return result
-
-        dispatcher = self.token_dispatcher
         # All-to-all: carry LoRA indices across EP ranks (same splits as hidden states)
         dispatched = all_to_all(
             dispatcher.ep_group,
@@ -866,24 +873,23 @@ def _patch_MoELayer():
             )
             dispatched = dispatched.squeeze(-1)
 
-        self._lora_post_dispatch = dispatched
-        del self._lora_pre_dispatch
+        # Set _expert_lora_indices on root NOW (before routed_experts_compute is called)
+        # so that the test hook (installed after our patch) can observe it,
+        # and LoraParallelLinear.forward (called inside routed_experts_compute) can use it.
+        root = _find_lora_root(self)
+        if root is not None:
+            root._expert_lora_indices = dispatched
+            self._lora_root_ref_for_cleanup = root
         return result
 
     def routed_experts_compute(self, hidden_states, probs):
-        post = getattr(self, '_lora_post_dispatch', None)
-        root = None
-        if post is not None:
-            root = _find_lora_root(self)
-            if root is not None:
-                root._expert_lora_indices = post
-
         result = _origin_routed_experts_compute(self, hidden_states, probs)
 
+        # Clean up: remove _expert_lora_indices after experts have run.
+        root = getattr(self, '_lora_root_ref_for_cleanup', None)
         if root is not None:
             root.__dict__.pop('_expert_lora_indices', None)
-        if post is not None:
-            self.__dict__.pop('_lora_post_dispatch', None)
+            del self._lora_root_ref_for_cleanup
         return result
 
     MoELayer.preprocess = preprocess
@@ -891,7 +897,14 @@ def _patch_MoELayer():
     MoELayer.routed_experts_compute = routed_experts_compute
 
 
+_patch_applied = False
+
+
 def apply_patch():
+    global _patch_applied
+    if _patch_applied:
+        return
+    _patch_applied = True
     _patch_flash_attn()
     _patch_transformer_engine()
     # patch peft

@@ -146,33 +146,48 @@ def test_ep2_grad_isolation():
 
 @requires_cuda
 def test_ep2_determinism():
-    """Same input + same routing is bit-identical across two calls, under EP=2."""
-    init_megatron(ep=EP_SIZE)
-    _patcher.apply_patch()
+    """Same input + same routing is bit-identical across two calls, under EP=2.
 
-    torch.manual_seed(3)
-    mg_models, bridge, config = build_moe_model(ep=EP_SIZE)
-    bridge.preallocate_adapters(mg_models, num_slots=1, lora_config=make_lora_config())
-    bridge.register_adapter(mg_models, "alpha", slot_index=0)
-    mg_models[0].train()
+    MoE models with AlltoAll dispatch use NCCL ops that are non-deterministic
+    by default.  Enable deterministic algorithms so that two identical forward
+    passes with the same routing produce exactly the same output.
+    """
+    # AlltoAll and scatter ops are non-deterministic without this flag.
+    # Reset to defaults at the end to avoid leaking state to subsequent tests.
+    prev_det = torch.are_deterministic_algorithms_enabled()
+    prev_cudnn = torch.backends.cudnn.deterministic
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    try:
+        init_megatron(ep=EP_SIZE)
+        _patcher.apply_patch()
 
-    vocab_size = config.padded_vocab_size
-    seq_len, batch = 8, 4
-    input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
-    position_ids = make_position_ids(config, seq_len, batch)
+        torch.manual_seed(3)
+        mg_models, bridge, config = build_moe_model(ep=EP_SIZE)
+        bridge.preallocate_adapters(mg_models, num_slots=1, lora_config=make_lora_config())
+        bridge.register_adapter(mg_models, "alpha", slot_index=0)
+        mg_models[0].eval()
 
-    with bridge.set_routing(mg_models, ["alpha", None, "alpha", None]):
-        with torch.no_grad():
-            out1 = mg_models[0](input_ids=input_ids, position_ids=position_ids,
-                                attention_mask=None)
-            logits1 = out1[0] if isinstance(out1, (tuple, list)) else out1
-        with torch.no_grad():
-            out2 = mg_models[0](input_ids=input_ids, position_ids=position_ids,
-                                attention_mask=None)
-            logits2 = out2[0] if isinstance(out2, (tuple, list)) else out2
+        vocab_size = config.padded_vocab_size
+        seq_len, batch = 8, 4
+        input_ids = torch.randint(0, vocab_size, (seq_len, batch), device="cuda")
+        position_ids = make_position_ids(config, seq_len, batch)
 
-    assert torch.equal(logits1, logits2), \
-        f"[rank {rank()}] Non-deterministic output; max diff={(logits1 - logits2).abs().max():.2e}"
+        with bridge.set_routing(mg_models, ["alpha", None, "alpha", None]):
+            with torch.no_grad():
+                out1 = mg_models[0](input_ids=input_ids, position_ids=position_ids,
+                                    attention_mask=None)
+                logits1 = out1[0] if isinstance(out1, (tuple, list)) else out1
+            with torch.no_grad():
+                out2 = mg_models[0](input_ids=input_ids, position_ids=position_ids,
+                                    attention_mask=None)
+                logits2 = out2[0] if isinstance(out2, (tuple, list)) else out2
+
+        assert torch.equal(logits1, logits2), \
+            f"[rank {rank()}] Non-deterministic output; max diff={(logits1 - logits2).abs().max():.2e}"
+    finally:
+        torch.use_deterministic_algorithms(prev_det, warn_only=True)
+        torch.backends.cudnn.deterministic = prev_cudnn
 
 
 @requires_cuda
