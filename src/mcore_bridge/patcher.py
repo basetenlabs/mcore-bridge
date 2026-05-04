@@ -757,7 +757,154 @@ def _patch_mtp():
     MultiTokenPredictionBlock.forward = forward
 
 
+def _patch_MoELayer():
+    """RouterReplay (R3): carry per-sequence LoRA adapter indices through MoE token dispatch.
+
+    Patches MoELayer.{preprocess,dispatch,routed_experts_compute} so that the per-sequence
+    adapter indices stamped on the root model by set_routing() survive the EP all-to-all and
+    secondary sort, ending up as root._expert_lora_indices in post-dispatch token order.
+    LoraParallelLinear.forward (is_expert=True) reads root._expert_lora_indices directly.
+
+    Only the AlltoAll dispatcher is supported; AllGather/Flex fall through silently.
+    """
+    try:
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.moe.token_dispatcher import (
+            MoEAlltoAllTokenDispatcher, all_to_all,
+        )
+        from megatron.core.transformer.moe.moe_utils import sort_chunks_by_idxs
+    except ImportError:
+        logger.warning('_patch_MoELayer: megatron MoE not found; EP LoRA routing disabled.')
+        return
+
+    def _find_lora_root(moe_layer):
+        """Walk expert sub-modules to find the cached root weakref."""
+        cached = getattr(moe_layer, '_moe_lora_root_ref', None)
+        if cached is not None:
+            return cached()
+        for m in moe_layer.modules():
+            ref = getattr(m, '_root_ref', None)
+            if ref is not None:
+                moe_layer._moe_lora_root_ref = ref
+                return ref()
+        return None
+
+    _origin_preprocess = MoELayer.preprocess
+    _origin_dispatch = MoELayer.dispatch
+    _origin_routed_experts_compute = MoELayer.routed_experts_compute
+
+    def preprocess(self, hidden_states, probs, routing_map):
+        result = _origin_preprocess(self, hidden_states, probs, routing_map)
+
+        if not isinstance(self.token_dispatcher, MoEAlltoAllTokenDispatcher):
+            return result
+
+        root = _find_lora_root(self)
+        adapter_indices = getattr(root, '_lora_adapter_indices', None) if root is not None else None
+        if adapter_indices is None:
+            return result
+
+        # Snapshot per-sequence adapter indices; expansion happens in dispatch()
+        # after token_dispatcher.dispatch() has set hidden_shape and
+        # reversed_local_input_permutation_mapping.
+        self._lora_seq_adapter_indices = adapter_indices
+
+        return result
+
+    def dispatch(self, hidden_states, probs):
+        result = _origin_dispatch(self, hidden_states, probs)
+
+        seq_indices = getattr(self, '_lora_seq_adapter_indices', None)
+        if seq_indices is None:
+            return result
+        del self._lora_seq_adapter_indices
+
+        dispatcher = self.token_dispatcher
+        # hidden_shape and reversed_local_input_permutation_mapping were set by
+        # dispatch_preprocess (called from MoELayer.preprocess, before dispatch).
+        hidden_shape = getattr(dispatcher, 'hidden_shape', None)
+        sorted_indices = getattr(dispatcher, 'reversed_local_input_permutation_mapping', None)
+        if hidden_shape is None or sorted_indices is None:
+            return result
+
+        # Expand per-sequence indices to per-token
+        total_tokens = 1
+        for d in hidden_shape[:-1]:
+            total_tokens *= d
+        batch = seq_indices.shape[0]
+        if total_tokens % batch == 0:
+            seq = total_tokens // batch
+            lora_tok = seq_indices.unsqueeze(0).expand(seq, batch).reshape(-1)
+        else:
+            lora_tok = seq_indices.reshape(-1)
+        lora_tok = lora_tok.to(sorted_indices.device)
+        # Apply same local permutation as dispatch applied to hidden states
+        pre = lora_tok[sorted_indices]
+
+        # All-to-all: carry LoRA indices across EP ranks (same splits as hidden states)
+        dispatched = all_to_all(
+            dispatcher.ep_group,
+            pre.float().unsqueeze(-1),
+            dispatcher.output_splits,
+            dispatcher.input_splits,
+        ).squeeze(-1).long()
+
+        # TP gather (mirrors dispatch_postprocess step 1)
+        tp_size = getattr(dispatcher, 'tp_size', 1)
+        if tp_size > 1:
+            from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+            output_split_sizes = (
+                dispatcher.output_splits_tp.tolist()
+                if getattr(dispatcher, 'output_splits_tp', None) is not None else None
+            )
+            dispatched = gather_from_sequence_parallel_region(
+                dispatched.float().unsqueeze(-1),
+                group=dispatcher.tp_group,
+                output_split_sizes=output_split_sizes,
+            ).squeeze(-1).long()
+
+        # Secondary sort by local expert (mirrors dispatch_postprocess step 2)
+        num_local = getattr(dispatcher, 'num_local_experts', 1)
+        if num_local > 1 and not getattr(dispatcher, 'drop_and_pad', False):
+            dispatched, _ = sort_chunks_by_idxs(
+                dispatched.unsqueeze(-1),
+                dispatcher.num_global_tokens_per_local_expert.ravel(),
+                dispatcher.sort_input_by_local_experts,
+            )
+            dispatched = dispatched.squeeze(-1)
+
+        # Set _expert_lora_indices on root NOW (before routed_experts_compute is called)
+        # so that the test hook (installed after our patch) can observe it,
+        # and LoraParallelLinear.forward (called inside routed_experts_compute) can use it.
+        root = _find_lora_root(self)
+        if root is not None:
+            root._expert_lora_indices = dispatched
+            self._lora_root_ref_for_cleanup = root
+        return result
+
+    def routed_experts_compute(self, hidden_states, probs):
+        result = _origin_routed_experts_compute(self, hidden_states, probs)
+
+        # Clean up: remove _expert_lora_indices after experts have run.
+        root = getattr(self, '_lora_root_ref_for_cleanup', None)
+        if root is not None:
+            root.__dict__.pop('_expert_lora_indices', None)
+            del self._lora_root_ref_for_cleanup
+        return result
+
+    MoELayer.preprocess = preprocess
+    MoELayer.dispatch = dispatch
+    MoELayer.routed_experts_compute = routed_experts_compute
+
+
+_patch_applied = False
+
+
 def apply_patch():
+    global _patch_applied
+    if _patch_applied:
+        return
+    _patch_applied = True
     _patch_flash_attn()
     _patch_transformer_engine()
     # patch peft
@@ -778,3 +925,7 @@ def apply_patch():
         _patch_dsa()
     except ImportError:
         pass
+    try:
+        _patch_MoELayer()
+    except Exception:
+        logger.warning('Failed to patch MoELayer for EP LoRA routing.')

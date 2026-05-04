@@ -181,6 +181,15 @@ class GPTModel(McoreGPTModel):
                 x2 = t[..., 1::2]
                 t = torch.cat((x1, x2), dim=-1)
 
+            # mrope forward returns freqs in SBHD [seq, batch, 1, dim]; t is BSHD
+            # [batch, seq, heads, dim].  Transpose freqs when the leading two dims are
+            # clearly swapped (avoids the size-mismatch broadcast failure).
+            if (freqs.dim() == 4 and t.dim() == 4
+                    and freqs.shape[0] == t.shape[1]
+                    and freqs.shape[1] == t.shape[0]
+                    and freqs.shape[0] != freqs.shape[1]):
+                freqs = freqs.transpose(0, 1).contiguous()
+
             # first part is cosine component
             # second part is sine component, need to change signs with _rotate_half method
             cos_ = (torch.cos(freqs) * mscale).to(t.dtype)

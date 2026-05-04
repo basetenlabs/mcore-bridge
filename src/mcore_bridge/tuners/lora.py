@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import warnings
+import weakref
 from contextlib import contextmanager, nullcontext
 from importlib import metadata
 from megatron.core import parallel_state
@@ -31,6 +32,46 @@ from .utils import tuners_sharded_state_dict
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+
+
+def apply_routed_lora(
+    result: torch.Tensor,
+    x: torch.Tensor,
+    adapter_indices: torch.Tensor,
+    lora_A_by_idx: dict,
+    lora_B_by_idx: dict,
+    scaling_by_idx: dict,
+    dropout_by_idx: dict,
+) -> torch.Tensor:
+    """Apply per-token LoRA routing to result in-place.
+
+    Args:
+        result: [tokens, out_features] base output, updated in-place.
+        x: [tokens, in_features] input to lora_A projections.
+        adapter_indices: [tokens] LongTensor; 0 = no LoRA for that token.
+        lora_A_by_idx: adapter_index -> lora_A callable.
+        lora_B_by_idx: adapter_index -> lora_B callable.
+        scaling_by_idx: adapter_index -> float scaling factor.
+        dropout_by_idx: adapter_index -> dropout callable.
+    Returns:
+        result (same tensor, modified in-place).
+    """
+    for idx in adapter_indices.unique().tolist():
+        if idx == 0:
+            continue
+        if idx not in lora_A_by_idx:
+            continue
+        mask = adapter_indices == idx
+        rows = mask.nonzero(as_tuple=True)[0]
+        x_sub = x.index_select(0, rows)
+        a_out = lora_A_by_idx[idx](dropout_by_idx[idx](x_sub))
+        if isinstance(a_out, tuple):
+            a_out = a_out[0]
+        b_out = lora_B_by_idx[idx](a_out)
+        if isinstance(b_out, tuple):
+            b_out = b_out[0]
+        result.index_add_(0, rows, (b_out * scaling_by_idx[idx]).to(result.dtype))
+    return result
 MINDSPEED_015 = version.parse('0.15.0')
 
 
@@ -142,6 +183,20 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         )
 
         self.is_target_conv_1d_layer = False
+        # Set by _patch_lora_model after PEFT wrapping; used for routing.
+        self._root_ref = None
+        # Maps adapter slot index (int) -> PEFT adapter name (str); set by GPTBridge registry.
+        self._idx_to_name: dict = {}
+
+    def _unload_adapter(self, name: str) -> None:
+        """Remove all state for adapter `name` from this layer."""
+        for d in (self.lora_A, self.lora_B, self.lora_dropout, self.scaling, self.r, self.lora_alpha):
+            d.pop(name, None)
+        if hasattr(self, 'lora_bias'):
+            self.lora_bias.pop(name, None)
+        remaining = list(self.lora_A.keys())
+        if remaining:
+            self.set_adapter(remaining)
 
     def update_layer(self, adapter_name, r, *, lora_alpha, lora_dropout, init_lora_weights, use_rslora, lora_bias,
                      **kwargs):
@@ -297,27 +352,57 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
     @contextmanager
     def _patch_router_gating(self):
         origin_gating = self.base_layer.__class__.gating
+        _lpl = self  # capture LoraParallelLinear for use inside closure
 
         def gating(_self, x):
             result = origin_gating(_self, x)
-            for active_adapter in self.active_adapters:
-                if active_adapter not in self.lora_A.keys():
-                    continue
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                x = x.to(result.dtype)
 
-                lora_result = F.linear(dropout(x), lora_A.weight.to(result.dtype))
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = F.linear(lora_result, lora_B.weight.to(result.dtype))
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_result * scaling
+            _root = _lpl._root_ref() if _lpl._root_ref is not None else None
+            _adapter_indices = getattr(_root, '_lora_adapter_indices', None) if _root is not None else None
 
-                result = result + lora_result
+            if _adapter_indices is not None and _lpl._idx_to_name:
+                # Per-sequence routing: dispatch LoRA delta per adapter slot
+                out_feat = result.shape[-1]
+                total_tokens = result.numel() // out_feat
+                batch = _adapter_indices.shape[0]
+                if total_tokens % batch == 0:
+                    seq = total_tokens // batch
+                    token_idx = _adapter_indices.unsqueeze(0).expand(seq, batch).reshape(-1)
+                else:
+                    token_idx = _adapter_indices.reshape(-1)
+                token_idx = token_idx.to(device=x.device)
+                result_flat = result.reshape(total_tokens, out_feat)
+                x_flat = x.reshape(total_tokens, -1)
+                for idx, slot in _lpl._idx_to_name.items():
+                    if slot not in _lpl.lora_A:
+                        continue
+                    mask = token_idx == idx
+                    if not mask.any():
+                        continue
+                    rows = mask.nonzero(as_tuple=True)[0]
+                    x_sub = x_flat.index_select(0, rows).to(result.dtype)
+                    delta = F.linear(_lpl.lora_dropout[slot](x_sub),
+                                     _lpl.lora_A[slot].weight.to(result.dtype))
+                    delta = F.linear(delta, _lpl.lora_B[slot].weight.to(result.dtype))
+                    result_flat.index_add_(0, rows, (delta * _lpl.scaling[slot]).to(result.dtype))
+                result = result_flat.view_as(result)
+            else:
+                # Single-adapter path
+                for active_adapter in _lpl.active_adapters:
+                    if active_adapter not in _lpl.lora_A.keys():
+                        continue
+                    lora_A = _lpl.lora_A[active_adapter]
+                    lora_B = _lpl.lora_B[active_adapter]
+                    dropout = _lpl.lora_dropout[active_adapter]
+                    scaling = _lpl.scaling[active_adapter]
+                    x = x.to(result.dtype)
+                    lora_result = F.linear(dropout(x), lora_A.weight.to(result.dtype))
+                    if isinstance(lora_result, tuple):
+                        lora_result = lora_result[0]
+                    lora_result = F.linear(lora_result, lora_B.weight.to(result.dtype))
+                    if isinstance(lora_result, tuple):
+                        lora_result = lora_result[0]
+                    result = result + lora_result * scaling
             return result
 
         self.base_layer.__class__.gating = gating
@@ -376,26 +461,112 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         else:
             raise ValueError(f'Unsupported base layer type: {type(self.base_layer)}')
         if not isinstance(self.base_layer, TopKRouter) and not self.disable_adapters and not self.merged:
-            for active_adapter in self.active_adapters:
-                if active_adapter not in self.lora_A.keys():
-                    continue
-                lora_A = self.lora_A[active_adapter]
-                lora_B = self.lora_B[active_adapter]
-                dropout = self.lora_dropout[active_adapter]
-                scaling = self.scaling[active_adapter]
-                dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
-                x = x.to(dtype)
+            _root = self._root_ref() if self._root_ref is not None else None
+            _adapter_indices = getattr(_root, '_lora_adapter_indices', None) if _root is not None else None
 
-                lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(
-                    dropout(x))
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_B(lora_result, *args, **kwargs) if isinstance(
-                    lora_B, TEGroupedLinear) else lora_B(lora_result)
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_result * scaling
-                result = result + lora_result
+            # Determine whether to use the routing path and which token_indices to use.
+            # Expert layers (is_expert=True) need post-dispatch indices from RouterReplay
+            # (_expert_lora_indices set by _patch_MoELayer in patcher.py). Non-expert layers
+            # expand the per-sequence adapter_indices to per-token indices directly.
+            token_indices = None
+            use_routing = _adapter_indices is not None and self._idx_to_name
+            if use_routing:
+                if self.is_expert:
+                    # RouterReplay path: post-dispatch token-level indices set by MoELayer patch
+                    token_indices = getattr(_root, '_expert_lora_indices', None)
+                    if token_indices is not None:
+                        token_indices = token_indices.to(device=x.device)
+                    else:
+                        use_routing = False  # no RouterReplay → fall to single-adapter path
+                else:
+                    # Standard expansion: [batch] → [total_tokens]
+                    out_feat = result.shape[-1]
+                    total_tokens = result.numel() // out_feat
+                    batch = _adapter_indices.shape[0]
+                    if total_tokens % batch == 0:
+                        seq = total_tokens // batch
+                        token_indices = (
+                            _adapter_indices.unsqueeze(0).expand(seq, batch).reshape(-1)
+                        )
+                    else:
+                        token_indices = _adapter_indices.reshape(-1)
+                    token_indices = token_indices.to(device=x.device)
+
+            if use_routing and token_indices is not None:
+                # ── routing path: per-token adapter dispatch ──────────────────
+                lora_A_by_idx, lora_B_by_idx, scaling_by_idx, dropout_by_idx = {}, {}, {}, {}
+                for idx, slot in self._idx_to_name.items():
+                    if slot in self.lora_A:
+                        lora_A_by_idx[idx] = self.lora_A[slot]
+                        lora_B_by_idx[idx] = self.lora_B[slot]
+                        scaling_by_idx[idx] = self.scaling[slot]
+                        dropout_by_idx[idx] = self.lora_dropout[slot]
+
+                if lora_A_by_idx:
+                    first_A = next(iter(lora_A_by_idx.values()))
+                    dtype = first_A.weight0.dtype if isinstance(first_A, TEGroupedLinear) else first_A.weight.dtype
+
+                    out_feat = result.shape[-1]
+                    total_tokens = result.numel() // out_feat
+                    if total_tokens > 0:
+                        x_flat = x.to(dtype).contiguous().reshape(total_tokens, -1)
+                        # Use a fresh delta buffer so index_add_ has no autograd-view conflict.
+                        # The out-of-place addition to result avoids in-place view issues.
+                        delta = torch.zeros(total_tokens, out_feat, dtype=dtype, device=result.device)
+
+                        if self.is_grouped and args and isinstance(first_A, TEGroupedLinear):
+                            # Expert grouped linear: lora_A/lora_B are TEGroupedLinear subclasses
+                            # whose per-expert weights are weight{k} with shape [out, in].
+                            # args[0] = m_splits encodes token-to-expert assignment.
+                            # Bypass TEGroupedLinear.forward (which needs m_splits for the full
+                            # fused kernel) by using F.linear per expert for gradient isolation.
+                            m_splits_list = args[0]
+                            offset = 0
+                            for k, n_k_raw in enumerate(m_splits_list):
+                                n_k = int(n_k_raw)
+                                offset_end = offset + n_k
+                                if n_k > 0:
+                                    sub_x = x_flat[offset:offset_end]
+                                    sub_idx = token_indices[offset:offset_end]
+                                    for idx, lora_A in lora_A_by_idx.items():
+                                        rows = (sub_idx == idx).nonzero(as_tuple=True)[0]
+                                        if rows.numel() == 0:
+                                            continue
+                                        x_sub = sub_x.index_select(0, rows)
+                                        w_A = getattr(lora_A, f'weight{k}')
+                                        w_B = getattr(lora_B_by_idx[idx], f'weight{k}')
+                                        a_out = F.linear(dropout_by_idx[idx](x_sub), w_A)
+                                        b_out = F.linear(a_out, w_B)
+                                        delta[offset:offset_end].index_add_(
+                                            0, rows, (b_out * scaling_by_idx[idx]).to(delta.dtype))
+                                offset = offset_end
+                        else:
+                            apply_routed_lora(delta, x_flat, token_indices,
+                                              lora_A_by_idx, lora_B_by_idx, scaling_by_idx, dropout_by_idx)
+
+                        result = result + delta.view_as(result).to(result.dtype)
+            else:
+                # ── existing single-adapter path ──────────────────────────────
+                for active_adapter in self.active_adapters:
+                    if active_adapter not in self.lora_A.keys():
+                        continue
+                    lora_A = self.lora_A[active_adapter]
+                    lora_B = self.lora_B[active_adapter]
+                    dropout = self.lora_dropout[active_adapter]
+                    scaling = self.scaling[active_adapter]
+                    dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
+                    x = x.to(dtype)
+
+                    lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(
+                        dropout(x))
+                    if isinstance(lora_result, tuple):
+                        lora_result = lora_result[0]
+                    lora_result = lora_B(lora_result, *args, **kwargs) if isinstance(
+                        lora_B, TEGroupedLinear) else lora_B(lora_result)
+                    if isinstance(lora_result, tuple):
+                        lora_result = lora_result[0]
+                    lora_result = lora_result * scaling
+                    result = result + lora_result
 
         result = result.to(previous_dtype)
         return result, bias
